@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, Response
 from store import blob_enabled, on_vercel, store
 
 PORT = 8000
-PAGE = Path(__file__).resolve().parent / "upload.html"
+FRONTEND_PORT = 5173
 UPLOAD_DIR = Path(tempfile.mkdtemp(prefix="dropeasy-"))
 
 session_token: str | None = None
@@ -47,7 +47,7 @@ def share_url(token: str) -> str:
         else:
             base = "https://" + os.environ["VERCEL_URL"]
         return f"{base}/send?t={token}"
-    return f"http://{lan_ip()}:{PORT}/?t={token}"
+    return f"http://{lan_ip()}:{FRONTEND_PORT}/send?t={token}"
 
 
 async def active_token() -> str | None:
@@ -178,11 +178,27 @@ async def download_file(name: str, request: Request, background: BackgroundTasks
     return FileResponse(path, filename=safe, content_disposition_type="attachment")
 
 
-@app.get("/")
-@app.get("/send")
-async def index(t: str | None = None):
+@app.delete("/api/files/{name}")
+async def delete_saved_file(name: str, request: Request):
+    local_only(request)
+    require_storage()
+    safe = safe_name(name)
+    if blob_enabled():
+        await store.delete_file(safe)
+        return {"deleted": safe}
+    path = stored_file(safe)
+    remove_file(path)
+    return {"deleted": safe}
+
+
+@app.get("/api/invite")
+async def invite(t: str | None = None):
     await check(t)
-    return FileResponse(PAGE)
+    return Response(
+        b'{"ok":true}',
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/upload")
@@ -205,6 +221,7 @@ async def upload(t: str | None = None, file: UploadFile = File(...)):
 
 
 if __name__ == "__main__":
-    print(f"\nPannello PC: http://localhost:5173")
+    print(f"\nPannello PC: http://localhost:{FRONTEND_PORT}")
+    print(f"Pagina telefono: http://localhost:{FRONTEND_PORT}/send")
     print(f"Server in ascolto sulla porta {PORT}\n")
     uvicorn.run(app, host="0.0.0.0", port=PORT)

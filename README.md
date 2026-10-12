@@ -17,6 +17,8 @@ Passa file dal telefono a questo PC. Dal computer avvii una condivisione, inquad
 - qrcode
 - File temporanei in locale; Vercel Blob quando l’app è deployata
 
+
+
 ## Installazione
 
 ```bash
@@ -41,7 +43,7 @@ Il pannello è su [http://localhost:5173](http://localhost:5173). Il server asco
 
 ## Screenshot
 
-Aggiungi qui uno screenshot dell'applicazione.
+![](screenshot\dropeasy-screenshot.png)
 
 ## Autore
 
