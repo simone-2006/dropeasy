@@ -1,17 +1,12 @@
 import { useEffect, useState } from 'react'
 import { ArrowDownToLine, X } from 'lucide-react'
 
-const fetchOpts = { credentials: 'include' }
-
 async function readError(res) {
   try {
     const body = await res.json()
     if (body?.detail) return String(body.detail)
   } catch {
     /* risposta non JSON */
-  }
-  if (res.status === 403) {
-    return 'Apri il pannello con il link che contiene il segreto (?k=…), oppure riapri quel link se il cookie è scaduto.'
   }
   return 'Il server non ha risposto. Avvialo sulla porta 8000.'
 }
@@ -54,7 +49,6 @@ function App() {
   const [hiding, setHiding] = useState(() => new Set())
   const [error, setError] = useState(null)
   const [starting, setStarting] = useState(false)
-  const [ready, setReady] = useState(false)
 
   const received = files.filter((file) => !hiding.has(file.name))
 
@@ -62,7 +56,7 @@ function App() {
     setStarting(true)
     setError(null)
     try {
-      const res = await fetch('/api/session', { method: 'POST', ...fetchOpts })
+      const res = await fetch('/api/session', { method: 'POST' })
       if (!res.ok) throw new Error(await readError(res))
       setDownloaded([])
       setHiding(new Set())
@@ -76,44 +70,12 @@ function App() {
 
   useEffect(() => {
     let stop = false
-
-    async function bootstrap() {
-      const params = new URLSearchParams(location.search)
-      const k = params.get('k')
-      if (k) {
-        try {
-          const res = await fetch('/api/panel/unlock', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ k }),
-            ...fetchOpts,
-          })
-          if (!res.ok && !stop) {
-            setError(await readError(res))
-          }
-        } catch {
-          if (!stop) setError('Impossibile sbloccare il pannello')
-        }
-        params.delete('k')
-        const next = params.toString()
-        const url = `${location.pathname}${next ? `?${next}` : ''}${location.hash}`
-        history.replaceState(null, '', url)
-      }
-
-      if (stop) return
-      try {
-        const res = await fetch('/api/session', fetchOpts)
-        if (res.ok && !stop) setSession(await res.json())
-        else if (res.status === 403 && !stop) {
-          setError(await readError(res))
-        }
-      } catch {
-        /* sessione assente o server spento */
-      }
-      if (!stop) setReady(true)
-    }
-
-    bootstrap()
+    fetch('/api/session')
+      .then(async (res) => {
+        if (!res.ok || stop) return
+        setSession(await res.json())
+      })
+      .catch(() => { })
     return () => {
       stop = true
     }
@@ -125,13 +87,8 @@ function App() {
 
     async function poll() {
       try {
-        const res = await fetch('/api/files', fetchOpts)
-        if (stop) return
-        if (res.status === 403) {
-          setError(await readError(res))
-          return
-        }
-        if (!res.ok) return
+        const res = await fetch('/api/files')
+        if (!res.ok || stop) return
         const incoming = await res.json()
         setFiles(incoming)
         const names = new Set(incoming.map((file) => file.name))
@@ -164,7 +121,7 @@ function App() {
   async function removeReceived(name) {
     setError(null)
     try {
-      const res = await fetch(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE', ...fetchOpts })
+      const res = await fetch(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' })
       if (!res.ok) throw new Error(await readError(res))
       setFiles((current) => current.filter((file) => file.name !== name))
       setHiding((current) => {
@@ -194,9 +151,7 @@ function App() {
         </div>
       </header>
 
-      {!ready ? (
-        <p className="mt-10 text-sm text-muted">Caricamento…</p>
-      ) : !session ? (
+      {!session ? (
         <section className="mt-10 rounded-md border border-border bg-surface px-6 py-8">
           <h2 className="font-display text-2xl">Pronto a ricevere</h2>
           <p className="mt-2 text-sm leading-6 text-muted">

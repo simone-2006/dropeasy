@@ -13,14 +13,13 @@ import qrcode.image.svg
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, Response
 
 from store import blob_enabled, on_vercel, store
 
 PORT = 8000
 FRONTEND_PORT = 5173
 UPLOAD_DIR = Path(tempfile.mkdtemp(prefix="dropeasy-"))
-PANEL_COOKIE = "dropeasy_panel"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 UPLOAD_RATE_LIMIT = 30
 UPLOAD_RATE_WINDOW = 60.0
@@ -35,7 +34,6 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
 )
 
 
@@ -80,25 +78,12 @@ async def check(t: str | None):
         raise HTTPException(403, "Token non valido")
 
 
-def panel_secret() -> str | None:
-    value = os.getenv("PANEL_SECRET")
-    return value if value else None
-
-
-def require_panel(request: Request):
-    if not on_vercel():
-        host = request.client.host if request.client else ""
-        if host not in {"127.0.0.1", "::1"}:
-            raise HTTPException(403, "Solo dal PC")
+def local_only(request: Request):
+    if on_vercel():
         return
-
-    secret = panel_secret()
-    if not secret:
-        raise HTTPException(503, "Imposta PANEL_SECRET sul progetto Vercel")
-
-    provided = request.cookies.get(PANEL_COOKIE) or request.headers.get("X-Panel-Secret")
-    if not tokens_match(provided, secret):
-        raise HTTPException(403, "Apri il pannello con il link che contiene il segreto (?k=…)")
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(403, "Solo dal PC")
 
 
 def require_storage():
@@ -149,43 +134,10 @@ def unique_local_path(name: str) -> Path:
     raise HTTPException(500, "Impossibile salvare il file")
 
 
-@app.post("/api/panel/unlock")
-async def unlock_panel(request: Request, k: str | None = None):
-    secret = panel_secret()
-    if not secret:
-        if on_vercel():
-            raise HTTPException(503, "Imposta PANEL_SECRET sul progetto Vercel")
-        return {"ok": True}
-
-    provided = k
-    if provided is None:
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                provided = body.get("k")
-        except Exception:
-            provided = None
-
-    if not tokens_match(provided if isinstance(provided, str) else None, secret):
-        raise HTTPException(403, "Segreto pannello non valido")
-
-    response = JSONResponse({"ok": True})
-    response.set_cookie(
-        key=PANEL_COOKIE,
-        value=secret,
-        httponly=True,
-        secure=on_vercel(),
-        samesite="lax",
-        path="/",
-        max_age=60 * 60 * 24 * 365,
-    )
-    return response
-
-
 @app.post("/api/session")
 async def start_session(request: Request):
     global session_token
-    require_panel(request)
+    local_only(request)
     require_storage()
     token = secrets.token_urlsafe(16)
     if blob_enabled():
@@ -197,7 +149,7 @@ async def start_session(request: Request):
 
 @app.get("/api/session")
 async def get_session(request: Request):
-    require_panel(request)
+    local_only(request)
     require_storage()
     token = await active_token()
     if not token:
@@ -207,7 +159,7 @@ async def get_session(request: Request):
 
 @app.get("/api/qr")
 async def qr(request: Request):
-    require_panel(request)
+    local_only(request)
     require_storage()
     token = await active_token()
     if not token:
@@ -241,7 +193,7 @@ def safe_name(name: str) -> str:
 
 @app.get("/api/files")
 async def files(request: Request):
-    require_panel(request)
+    local_only(request)
     require_storage()
     if blob_enabled():
         return await store.list_files()
@@ -256,7 +208,7 @@ def remove_file(path: Path):
 
 @app.get("/api/files/{name}")
 async def download_file(name: str, request: Request, background: BackgroundTasks):
-    require_panel(request)
+    local_only(request)
     require_storage()
     safe = safe_name(name)
     if blob_enabled():
@@ -279,7 +231,7 @@ async def download_file(name: str, request: Request, background: BackgroundTasks
 
 @app.delete("/api/files/{name}")
 async def delete_saved_file(name: str, request: Request):
-    require_panel(request)
+    local_only(request)
     require_storage()
     safe = safe_name(name)
     if blob_enabled():
