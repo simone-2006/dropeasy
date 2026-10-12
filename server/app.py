@@ -1,17 +1,22 @@
+import os
 import secrets
 import socket
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import quote
 
 import qrcode
 import qrcode.image.svg
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, Response
+
+from store import blob_enabled, on_vercel, store
 
 PORT = 8000
+PAGE = Path(__file__).resolve().parent / "upload.html"
 UPLOAD_DIR = Path(tempfile.mkdtemp(prefix="dropeasy-"))
 
 session_token: str | None = None
@@ -24,50 +29,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PAGE = """<!doctype html>
-<html lang="it"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Invia al PC</title>
-<style>
-  body{font-family:system-ui;max-width:480px;margin:2rem auto;padding:0 1rem}
-  button{width:100%;padding:.9rem;font-size:1rem;margin-top:1rem}
-  .row{margin:.6rem 0;font-size:.9rem}
-  progress{width:100%}
-</style></head><body>
-<h2>Invia file al PC</h2>
-<input type="file" id="f" multiple>
-<button id="b">Invia</button>
-<div id="out"></div>
-<script>
-const T = new URLSearchParams(location.search).get("t");
-const out = document.getElementById("out");
-
-function send(file) {
-  return new Promise(res => {
-    const row = document.createElement("div");
-    row.className = "row";
-    row.innerHTML = file.name + '<br><progress max="100" value="0"></progress> <span></span>';
-    out.appendChild(row);
-    const bar = row.querySelector("progress"), st = row.querySelector("span");
-    const fd = new FormData();
-    fd.append("file", file);
-    const x = new XMLHttpRequest();
-    x.open("POST", "/upload?t=" + encodeURIComponent(T));
-    x.upload.onprogress = e => { if (e.lengthComputable) bar.value = e.loaded / e.total * 100; };
-    x.onload = () => { st.textContent = x.status === 200 ? "✔" : "✘ " + x.status; res(); };
-    x.onerror = () => { st.textContent = "✘ errore di rete"; res(); };
-    x.send(fd);
-  });
-}
-
-document.getElementById("b").onclick = async () => {
-  const files = document.getElementById("f").files;
-  for (const f of files) await send(f);
-};
-</script></body></html>"""
-
-
 def lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -79,48 +40,80 @@ def lan_ip() -> str:
         s.close()
 
 
-def share_url() -> str:
-    return f"http://{lan_ip()}:{PORT}/?t={session_token}"
+def share_url(token: str) -> str:
+    if on_vercel():
+        if os.getenv("VERCEL_ENV") == "production" and os.getenv("VERCEL_PROJECT_PRODUCTION_URL"):
+            base = "https://" + os.environ["VERCEL_PROJECT_PRODUCTION_URL"]
+        else:
+            base = "https://" + os.environ["VERCEL_URL"]
+        return f"{base}/send?t={token}"
+    return f"http://{lan_ip()}:{PORT}/?t={token}"
 
 
-def check(t: str | None):
-    if (
-        not session_token
-        or not t
-        or len(t) != len(session_token)
-        or not secrets.compare_digest(t, session_token)
-    ):
+async def active_token() -> str | None:
+    if blob_enabled():
+        return await store.read_session()
+    return session_token
+
+
+def tokens_match(t: str | None, expected: str | None) -> bool:
+    return bool(
+        expected
+        and t
+        and len(t) == len(expected)
+        and secrets.compare_digest(t, expected)
+    )
+
+
+async def check(t: str | None):
+    if not tokens_match(t, await active_token()):
         raise HTTPException(403, "Token non valido")
 
 
 def local_only(request: Request):
+    if on_vercel():
+        return
     host = request.client.host if request.client else ""
     if host not in {"127.0.0.1", "::1"}:
         raise HTTPException(403, "Solo dal PC")
 
 
+def require_storage():
+    if on_vercel() and not blob_enabled():
+        raise HTTPException(503, "Collega un Blob store al progetto Vercel")
+
+
 @app.post("/api/session")
-def start_session(request: Request):
+async def start_session(request: Request):
     global session_token
     local_only(request)
-    session_token = secrets.token_urlsafe(8)
-    return {"url": share_url()}
+    require_storage()
+    token = secrets.token_urlsafe(8)
+    if blob_enabled():
+        await store.write_session(token)
+    else:
+        session_token = token
+    return {"url": share_url(token)}
 
 
 @app.get("/api/session")
-def get_session(request: Request):
+async def get_session(request: Request):
     local_only(request)
-    if not session_token:
+    require_storage()
+    token = await active_token()
+    if not token:
         raise HTTPException(404, "Nessuna condivisione attiva")
-    return {"url": share_url()}
+    return {"url": share_url(token)}
 
 
 @app.get("/api/qr")
-def qr(request: Request):
+async def qr(request: Request):
     local_only(request)
-    if not session_token:
+    require_storage()
+    token = await active_token()
+    if not token:
         raise HTTPException(404, "Nessuna condivisione attiva")
-    image = qrcode.make(share_url(), image_factory=qrcode.image.svg.SvgPathImage)
+    image = qrcode.make(share_url(token), image_factory=qrcode.image.svg.SvgPathImage)
     buffer = BytesIO()
     image.save(buffer)
     return Response(
@@ -140,9 +133,19 @@ def stored_file(name: str) -> Path:
     return dest
 
 
+def safe_name(name: str) -> str:
+    safe = Path(name).name
+    if not safe or safe != name:
+        raise HTTPException(400, "Nome non valido")
+    return safe
+
+
 @app.get("/api/files")
-def files(request: Request):
+async def files(request: Request):
     local_only(request)
+    require_storage()
+    if blob_enabled():
+        return await store.list_files()
     saved = [path for path in UPLOAD_DIR.iterdir() if path.is_file()]
     saved.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return [{"name": path.name, "size": path.stat().st_size} for path in saved]
@@ -153,23 +156,43 @@ def remove_file(path: Path):
 
 
 @app.get("/api/files/{name}")
-def download_file(name: str, request: Request, background: BackgroundTasks):
+async def download_file(name: str, request: Request, background: BackgroundTasks):
     local_only(request)
-    path = stored_file(name)
+    require_storage()
+    safe = safe_name(name)
+    if blob_enabled():
+        try:
+            data = await store.read_file(safe)
+        except FileNotFoundError:
+            raise HTTPException(404, "File non trovato")
+        background.add_task(store.delete_file, safe)
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{safe}\"; filename*=UTF-8''{quote(safe)}"
+            },
+        )
+    path = stored_file(safe)
     background.add_task(remove_file, path)
-    return FileResponse(path, filename=name, content_disposition_type="attachment")
+    return FileResponse(path, filename=safe, content_disposition_type="attachment")
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(t: str | None = None):
-    check(t)
-    return PAGE
+@app.get("/")
+@app.get("/send")
+async def index(t: str | None = None):
+    await check(t)
+    return FileResponse(PAGE)
 
 
 @app.post("/upload")
 async def upload(t: str | None = None, file: UploadFile = File(...)):
-    check(t)
-    name = Path(file.filename or "file").name  # evita path traversal
+    await check(t)
+    name = safe_name(Path(file.filename or "file").name)
+    if blob_enabled():
+        data = await file.read()
+        saved = await store.save_file(name, data)
+        return {"saved": saved}
     dest = UPLOAD_DIR / name
     i = 1
     while dest.exists():  # non sovrascrive

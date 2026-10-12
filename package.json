@@ -1,0 +1,27 @@
+{
+  "name": "dropeasy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/simone-2006/dropeasy.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/simone-2006/dropeasy/issues"
+  },
+  "homepage": "https://github.com/simone-2006/dropeasy#readme",
+  "scripts": {
+    "start": "concurrently \"cd frontend && npm run dev\" \"cd server && python app.py\""
+  },
+  "dependencies": {
+    "concurrently": "^10.0.6"
+  }
+}

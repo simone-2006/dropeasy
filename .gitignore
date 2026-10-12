@@ -1,0 +1,10 @@
+node_modules
+frontend/node_modules
+frontend/dist
+.vercel
+.venv
+__pycache__
+*.pyc
+.env
+.env*.local
+uploads

@@ -2,3 +2,4 @@ fastapi
 uvicorn
 python-multipart
 qrcode
+vercel>=0.11.6
