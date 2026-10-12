@@ -8,3 +8,6 @@ __pycache__
 .env
 .env*.local
 uploads
+
+.vercel
+.env*
