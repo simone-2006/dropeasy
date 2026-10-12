@@ -2,6 +2,8 @@ import os
 import secrets
 import socket
 import tempfile
+import time
+from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -11,15 +13,21 @@ import qrcode.image.svg
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from store import blob_enabled, on_vercel, store
 
 PORT = 8000
 FRONTEND_PORT = 5173
 UPLOAD_DIR = Path(tempfile.mkdtemp(prefix="dropeasy-"))
+PANEL_COOKIE = "dropeasy_panel"
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+UPLOAD_RATE_LIMIT = 30
+UPLOAD_RATE_WINDOW = 60.0
+CHUNK_SIZE = 1024 * 1024
 
 session_token: str | None = None
+_upload_hits: dict[str, list[float]] = defaultdict(list)
 
 app = FastAPI()
 app.add_middleware(
@@ -27,7 +35,9 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
 
 def lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -70,12 +80,25 @@ async def check(t: str | None):
         raise HTTPException(403, "Token non valido")
 
 
-def local_only(request: Request):
-    if on_vercel():
+def panel_secret() -> str | None:
+    value = os.getenv("PANEL_SECRET")
+    return value if value else None
+
+
+def require_panel(request: Request):
+    if not on_vercel():
+        host = request.client.host if request.client else ""
+        if host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(403, "Solo dal PC")
         return
-    host = request.client.host if request.client else ""
-    if host not in {"127.0.0.1", "::1"}:
-        raise HTTPException(403, "Solo dal PC")
+
+    secret = panel_secret()
+    if not secret:
+        raise HTTPException(503, "Imposta PANEL_SECRET sul progetto Vercel")
+
+    provided = request.cookies.get(PANEL_COOKIE) or request.headers.get("X-Panel-Secret")
+    if not tokens_match(provided, secret):
+        raise HTTPException(403, "Apri il pannello con il link che contiene il segreto (?k=…)")
 
 
 def require_storage():
@@ -83,12 +106,88 @@ def require_storage():
         raise HTTPException(503, "Collega un Blob store al progetto Vercel")
 
 
+def drop_token(request: Request, t: str | None) -> str | None:
+    return request.headers.get("X-Drop-Token") or t
+
+
+def check_upload_rate(token: str):
+    now = time.monotonic()
+    window_start = now - UPLOAD_RATE_WINDOW
+    hits = [ts for ts in _upload_hits[token] if ts >= window_start]
+    if len(hits) >= UPLOAD_RATE_LIMIT:
+        _upload_hits[token] = hits
+        raise HTTPException(429, "Troppi upload, riprova tra un minuto")
+    hits.append(now)
+    _upload_hits[token] = hits
+
+
+async def read_limited(file: UploadFile, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(413, f"File troppo grande (max {limit} byte)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def unique_local_path(name: str) -> Path:
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    for _ in range(32):
+        candidate = UPLOAD_DIR / f"{stem}_{secrets.token_hex(4)}{suffix}"
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            continue
+    raise HTTPException(500, "Impossibile salvare il file")
+
+
+@app.post("/api/panel/unlock")
+async def unlock_panel(request: Request, k: str | None = None):
+    secret = panel_secret()
+    if not secret:
+        if on_vercel():
+            raise HTTPException(503, "Imposta PANEL_SECRET sul progetto Vercel")
+        return {"ok": True}
+
+    provided = k
+    if provided is None:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                provided = body.get("k")
+        except Exception:
+            provided = None
+
+    if not tokens_match(provided if isinstance(provided, str) else None, secret):
+        raise HTTPException(403, "Segreto pannello non valido")
+
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key=PANEL_COOKIE,
+        value=secret,
+        httponly=True,
+        secure=on_vercel(),
+        samesite="lax",
+        path="/",
+        max_age=60 * 60 * 24 * 365,
+    )
+    return response
+
+
 @app.post("/api/session")
 async def start_session(request: Request):
     global session_token
-    local_only(request)
+    require_panel(request)
     require_storage()
-    token = secrets.token_urlsafe(8)
+    token = secrets.token_urlsafe(16)
     if blob_enabled():
         await store.write_session(token)
     else:
@@ -98,7 +197,7 @@ async def start_session(request: Request):
 
 @app.get("/api/session")
 async def get_session(request: Request):
-    local_only(request)
+    require_panel(request)
     require_storage()
     token = await active_token()
     if not token:
@@ -108,7 +207,7 @@ async def get_session(request: Request):
 
 @app.get("/api/qr")
 async def qr(request: Request):
-    local_only(request)
+    require_panel(request)
     require_storage()
     token = await active_token()
     if not token:
@@ -142,7 +241,7 @@ def safe_name(name: str) -> str:
 
 @app.get("/api/files")
 async def files(request: Request):
-    local_only(request)
+    require_panel(request)
     require_storage()
     if blob_enabled():
         return await store.list_files()
@@ -157,7 +256,7 @@ def remove_file(path: Path):
 
 @app.get("/api/files/{name}")
 async def download_file(name: str, request: Request, background: BackgroundTasks):
-    local_only(request)
+    require_panel(request)
     require_storage()
     safe = safe_name(name)
     if blob_enabled():
@@ -180,7 +279,7 @@ async def download_file(name: str, request: Request, background: BackgroundTasks
 
 @app.delete("/api/files/{name}")
 async def delete_saved_file(name: str, request: Request):
-    local_only(request)
+    require_panel(request)
     require_storage()
     safe = safe_name(name)
     if blob_enabled():
@@ -192,8 +291,8 @@ async def delete_saved_file(name: str, request: Request):
 
 
 @app.get("/api/invite")
-async def invite(t: str | None = None):
-    await check(t)
+async def invite(request: Request, t: str | None = None):
+    await check(drop_token(request, t))
     return Response(
         b'{"ok":true}',
         media_type="application/json",
@@ -202,21 +301,32 @@ async def invite(t: str | None = None):
 
 
 @app.post("/upload")
-async def upload(t: str | None = None, file: UploadFile = File(...)):
-    await check(t)
+async def upload(request: Request, t: str | None = None, file: UploadFile = File(...)):
+    token = drop_token(request, t)
+    await check(token)
+    assert token is not None
+    check_upload_rate(token)
     name = safe_name(Path(file.filename or "file").name)
     if blob_enabled():
-        data = await file.read()
+        data = await read_limited(file, MAX_UPLOAD_BYTES)
         saved = await store.save_file(name, data)
         return {"saved": saved}
-    dest = UPLOAD_DIR / name
-    i = 1
-    while dest.exists():  # non sovrascrive
-        dest = UPLOAD_DIR / f"{Path(name).stem}_{i}{Path(name).suffix}"
-        i += 1
-    with open(dest, "wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            out.write(chunk)
+
+    dest = unique_local_path(name)
+    written = 0
+    try:
+        with open(dest, "wb") as out:
+            while chunk := await file.read(CHUNK_SIZE):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"File troppo grande (max {MAX_UPLOAD_BYTES} byte)")
+                out.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     return {"saved": dest.name}
 
 

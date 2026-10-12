@@ -35,7 +35,8 @@ function uploadFile(file, onProgress) {
         const body = new FormData()
         body.append('file', file)
         const xhr = new XMLHttpRequest()
-        xhr.open('POST', `/upload?t=${encodeURIComponent(token)}`)
+        xhr.open('POST', '/upload')
+        if (token) xhr.setRequestHeader('X-Drop-Token', token)
         xhr.upload.onprogress = (event) => {
             if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100))
         }
@@ -73,7 +74,10 @@ function Send() {
 
         async function checkInvite() {
             try {
-                const res = await fetch(`/api/invite?t=${encodeURIComponent(token)}`, { cache: 'no-store' })
+                const res = await fetch('/api/invite', {
+                    cache: 'no-store',
+                    headers: token ? { 'X-Drop-Token': token } : {},
+                })
                 if (stop) return
                 if (res.ok) {
                     wasValid = true

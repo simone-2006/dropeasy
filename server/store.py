@@ -1,4 +1,5 @@
 import os
+import secrets
 from pathlib import Path
 
 FILE_PREFIX = "dropeasy/files/"
@@ -57,23 +58,25 @@ class BlobStore:
         return [item[1] for item in items]
 
     async def save_file(self, name: str, data: bytes) -> str:
-        taken = {item["name"] for item in await self.list_files()}
-        dest = name
         stem = Path(name).stem
         suffix = Path(name).suffix
-        i = 1
-        while dest in taken:
-            dest = f"{stem}_{i}{suffix}"
-            i += 1
-        await (await self.client()).put(
-            FILE_PREFIX + dest,
-            data,
-            access="private",
-            overwrite=False,
-            add_random_suffix=False,
-            content_type="application/octet-stream",
-        )
-        return dest
+        last_error: Exception | None = None
+        for _ in range(8):
+            dest = f"{stem}_{secrets.token_hex(4)}{suffix}"
+            try:
+                await (await self.client()).put(
+                    FILE_PREFIX + dest,
+                    data,
+                    access="private",
+                    overwrite=False,
+                    add_random_suffix=False,
+                    content_type="application/octet-stream",
+                )
+                return dest
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"Impossibile salvare {name}") from last_error
 
     async def read_file(self, name: str) -> bytes:
         from vercel.blob import BlobNotFoundError

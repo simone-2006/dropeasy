@@ -41,9 +41,18 @@ npm start
 
 Il pannello è su [http://localhost:5173](http://localhost:5173). Il server ascolta sulla porta 8000.
 
+## Deploy su Vercel
+
+1. Collega un Blob store al progetto (`BLOB_READ_WRITE_TOKEN`).
+2. Imposta la variabile d’ambiente `PANEL_SECRET` (stringa lunga e casuale, es. output di `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+3. Opzionale: `MAX_UPLOAD_BYTES` (default 50 MB).
+4. Apri una volta `https://tuodominio/?k=VALORE_DI_PANEL_SECRET`: il sito salva un cookie e puoi bookmarkare la home senza `k` nella barra.
+
+La pagina telefono `/send?t=…` e l’upload restano protetti solo dal token di sessione, senza cookie del pannello.
+
 ## Screenshot
 
-![](screenshot\dropeasy-screenshot.png)
+![](screenshot/dropeasy-screenshot.png)
 
 ## Autore
 
